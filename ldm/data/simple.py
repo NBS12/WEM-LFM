@@ -143,7 +143,7 @@ class ObjaverseDataModuleFromConfig(pl.LightningDataModule):
 import pandas as pd
 import scipy.ndimage
 class CustomDataset(Dataset):
-    def __init__(self,img_dir='DATA_FOLDER',train_val_test='train'):
+    def __init__(self,img_dir='/dev/raid/zjs_dc3/24sxx/data/',train_val_test='train'):
         train_val_test_dict = {'train': 'trainset_normalized.csv', 'val': 'valset_normalized.csv', 'test': 'testset_normalized.csv'}
         self.labelfile = os.path.join('files',train_val_test_dict[train_val_test])
         self.label_array=np.array(pd.read_csv(self.labelfile))
@@ -179,7 +179,7 @@ class CustomDataset(Dataset):
 
         return 1-mask
     
-    def gaussian_smooth_and_normalize(self, hard_labels, sigma=1.0):
+    def gaussian_smooth_and_normalize(self, hard_labels, sigma=1.5):
         """
         Apply Gaussian smoothing to a segmentation mask with labels {0, 1, 2},
         and normalize the resulting soft labels to the range [0, 1].
@@ -198,6 +198,27 @@ class CustomDataset(Dataset):
         soft_labels = (smoothed_labels - smoothed_labels.min()) / (smoothed_labels.max() - smoothed_labels.min())
         
         return soft_labels
+
+
+    def build_full_mask_with_blurred_lesion(self, hard_labels, sigma=1.5):
+        bg_mask = (hard_labels == 0).astype(np.float32)
+        breast_mask = (hard_labels == 1).astype(np.float32)
+        lesion_mask = (hard_labels == 2).astype(np.float32)
+
+        # 只对 lesion 做 Gaussian
+        if lesion_mask.sum() > 0:
+            lesion_soft = scipy.ndimage.gaussian_filter(lesion_mask, sigma=sigma)
+            lesion_soft = np.clip(lesion_soft, 0.0, None)
+
+            max_val = lesion_soft.max()
+            if max_val > 0:
+                lesion_soft = lesion_soft / max_val
+        else:
+            lesion_soft = np.zeros_like(lesion_mask, dtype=np.float32)
+
+        full_mask = np.stack([bg_mask, breast_mask, lesion_soft], axis=0)
+
+        return full_mask, lesion_mask
     
     def __getitem__(self, idx):
         cc_img_path = os.path.join(self.cc_img_root, self.images[idx])
@@ -205,11 +226,18 @@ class CustomDataset(Dataset):
         cc_image= self.image_transform(Image.open(cc_img_path).convert("RGB"))
         cc_mask = self.mask_transform(Image.open(cc_mask_path).convert("L"))
         hardlabel=np.array(cc_mask)
-        softlabel=self.gaussian_smooth_and_normalize(hardlabel, sigma=1)
+        #softlabel=self.gaussian_smooth_and_normalize(hardlabel, sigma=1.5)
+        # ✅ 新逻辑
+        full_mask, lesion_mask = self.build_full_mask_with_blurred_lesion(
+            hardlabel, sigma=1.5
+        )
         
         data = {}
         data["image_target"] = cc_image
-        data["image_cond"] = torch.FloatTensor(softlabel).unsqueeze(0).repeat(3,1,1)
+        #data["image_cond"] = torch.FloatTensor(softlabel).unsqueeze(0).repeat(3,1,1)
+        # ✅ 三通道mask（替代原来的 repeat）
+        data["image_cond"] = torch.FloatTensor(full_mask)
+
         data["mass_cond"]= torch.FloatTensor((hardlabel==2).astype(np.float32)).unsqueeze(0).repeat(3,1,1)
         if self.images[idx] in self.label_dict:
             data["additional_feature"]= torch.FloatTensor((self.label_dict[self.images[idx]]).astype(np.float32)).unsqueeze(0)

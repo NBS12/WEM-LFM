@@ -193,7 +193,7 @@ def compute_IoU_PA(mask_path,fake_path,box_path,device='cuda:0'):
         else:
             mask_dict[maskid].append(name)
     
-    MedSAM_CKPT_PATH = "pre_trained/medsam/medsam_vit_b.pth"
+    MedSAM_CKPT_PATH = "medsam_vit_b.pth"
     medsam_model = sam_model_registry['vit_b'](checkpoint=MedSAM_CKPT_PATH)
     medsam_model = medsam_model.to(device)
     medsam_model.eval()
@@ -212,7 +212,7 @@ def compute_IoU_PA(mask_path,fake_path,box_path,device='cuda:0'):
                     boxpath=os.path.join(box_path,box_name)
                     medsam_seg,_,box=seg_inference(img_path,boxpath,medsam_model,device)
                     seg_mask[medsam_seg==1]=2
-                metric.addBatch(mask, seg_mask)
+                metric.addBatch(seg_mask, mask)
                 Image.fromarray(seg_mask.astype(np.uint8)).save(save)
     pa = metric.pixelAccuracy()
     cpa = metric.classPixelAccuracy()
@@ -228,12 +228,12 @@ def compute_IoU_PA(mask_path,fake_path,box_path,device='cuda:0'):
 
 if __name__ == '__main__':
 
-    real_path='DATA_FOLDER/images/test'
-    mask_path='DATA_FOLDER/masks/test'
-    box_path='DATA_FOLDER/bbox/test'
+    real_path=r'/dev/raid/zjs_dc3/24sxx/data/images/test'
+    mask_path=r'/dev/raid/zjs_dc3/24sxx/data/masks/test'
+    box_path=r'/dev/raid/zjs_dc3/24sxx/data/box'
 
     device = "cuda:0"
-    fake='test_results'
+    fake=r'/home/zjs/sxx24/Gated-Conditional-Diffusion-Model/v2.0results/test_results_7.5'
     compute_fid(real_path,fake,device=device)
     compute_IoU_PA(mask_path,fake,box_path,device=device)
    

@@ -52,7 +52,7 @@ def get_parser(**parser_kwargs):
         "--finetune_from",
         type=str,
         nargs="?",
-        default="",
+        default=r"sd-image-conditioned-v2.ckpt",
         help="path to checkpoint to load model state from"
     )
     parser.add_argument(
@@ -131,7 +131,7 @@ def get_parser(**parser_kwargs):
         "-l",
         "--logdir",
         type=str,
-        default="/memory/a100/outputs/zero123/logs_ccgan",
+        default="logs",
         help="directory for logging dat shit",
     )
     parser.add_argument(
@@ -661,16 +661,31 @@ if __name__ == "__main__":
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
-        trainer_config["accelerator"] = "ddp"
+        #trainer_config["accelerator"] = "ddp"
+        has_gpu_config = "gpus" in trainer_config or "devices" in trainer_config
+        if has_gpu_config:
+            # Set accelerator to gpu for GPU training
+            trainer_config["accelerator"] = "gpu"
+            if "gpus" in trainer_config:
+                gpuinfo = trainer_config["gpus"]
+                rank_zero_print(f"Running on GPUs {gpuinfo}")
+            elif "devices" in trainer_config:
+                gpuinfo = trainer_config["devices"]
+                rank_zero_print(f"Running on {gpuinfo} devices")
+            cpu = False
+        else:
+            # CPU training
+            trainer_config["accelerator"] = "cpu"
+            cpu = True
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["gpus"]
-            rank_zero_print(f"Running on GPUs {gpuinfo}")
-            cpu = False
+        # if not "gpus" in trainer_config:
+        #     del trainer_config["accelerator"]
+        #     cpu = True
+        # else:
+        #     gpuinfo = trainer_config["gpus"]
+        #     rank_zero_print(f"Running on GPUs {gpuinfo}")
+        #     cpu = False
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
@@ -760,7 +775,7 @@ if __name__ == "__main__":
         if hasattr(model, "monitor"):
             rank_zero_print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
+            default_modelckpt_cfg["params"]["save_top_k"] = 2
 
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
@@ -789,8 +804,8 @@ if __name__ == "__main__":
             "image_logger": {
                 "target": "main.ImageLogger",
                 "params": {
-                    "batch_frequency": 750,
-                    "max_images": 4,
+                    "batch_frequency": 500,   #750
+                    "max_images": 2,  #4
                     "clamp": True
                 }
             },
@@ -824,7 +839,7 @@ if __name__ == "__main__":
                          "filename": "{epoch:06}-{step:09}",
                          "verbose": True,
                          'save_top_k': -1,
-                         'every_n_train_steps': 5000,
+                         'every_n_train_steps': 7000,
                          'save_weights_only': True
                      }
                      }
@@ -872,7 +887,15 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        #     ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        # else:
+        #     ngpu = 1
+            if hasattr(lightning_config.trainer, 'gpus'):
+                ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            elif hasattr(lightning_config.trainer, 'devices'):
+                ngpu = lightning_config.trainer.devices
+            else:
+                ngpu = 1
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:

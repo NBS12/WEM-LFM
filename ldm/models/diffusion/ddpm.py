@@ -805,8 +805,14 @@ class LatentDiffusion(DDPM):
             cond["c_crossattn"] = [prompt_mask*c_crossattn]
 
         cond["c_concat"] = [input_mask*self.encode_first_stage((xc.to(self.device))).mode().detach()]
+        # lesion-aware loss mask, aligned to latent resolution
+        lesion_mask = mass[:, :1, :, :]  # [B,1,H,W]
+        lesion_mask_latent = torch.nn.functional.interpolate(
+        lesion_mask, size=z.shape[-2:], mode="nearest"
+        )
+        #cond["lesion_mask"] = lesion_mask_latent
         
-        out = [z, cond]
+        out = [z, cond,lesion_mask_latent]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -915,11 +921,11 @@ class LatentDiffusion(DDPM):
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        x, c, lesion_mask = self.get_input(batch, self.first_stage_key)
+        loss = self(x, c, lesion_mask=lesion_mask)
         return loss
 
-    def forward(self, x, c, *args, **kwargs):
+    def forward(self, x, c, lesion_mask=None,*args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
@@ -928,7 +934,7 @@ class LatentDiffusion(DDPM):
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, c, t, lesion_mask=lesion_mask,*args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -940,16 +946,30 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False):
+    # def apply_model(self, x_noisy, t, cond, return_ids=False):
+    def apply_model(self, x_noisy, t, cond, return_ids=False, lesion_mask=None):
+
+        # if isinstance(cond, dict):
+        #     # hybrid case, cond is exptected to be a dict
+        #     pass
+        # else:
+        #     if not isinstance(cond, list):
+        #         cond = [cond]
+        #     key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
+        #     cond = {key: cond}
 
         if isinstance(cond, dict):
-            # hybrid case, cond is exptected to be a dict
             pass
         else:
             if not isinstance(cond, list):
                 cond = [cond]
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
             cond = {key: cond}
+
+# 关键：从 cond 中取出 lesion_mask，避免后面 **cond 重复传参
+        if isinstance(cond, dict) and "lesion_mask" in cond:
+            lesion_mask = cond.pop("lesion_mask")
+            cond = {k: v for k, v in cond.items() if k != "lesion_mask"}
 
         if hasattr(self, "split_input_params"):
             assert len(cond) == 1  # todo can only deal with one conditioning atm
@@ -1031,7 +1051,8 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            # x_recon = self.model(x_noisy, t, **cond)
+            x_recon = self.model(x_noisy,t,lesion_mask=lesion_mask,**cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1056,10 +1077,11 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, cond, t, lesion_mask=None,noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+        # model_output = self.apply_model(x_noisy, t, cond)
+        model_output = self.apply_model(x_noisy,t,cond,lesion_mask=lesion_mask)
 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
@@ -1071,7 +1093,24 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+
+
+        # unreduced pixel-wise loss: [B,C,H,W]
+        loss_raw = self.get_loss(model_output, target, mean=False)
+
+        # ===== lesion-aware weighting =====
+        if lesion_mask is not None:
+            lesion_mask = lesion_mask.to(loss_raw.device)   # [B,1,H,W]
+            lambda_lesion = 1.0   # 建议先从 1.0 / 2.0 / 3.0 做消融
+            weight_map = 1.0 + lambda_lesion * lesion_mask  # [B,1,H,W]
+            loss_raw = loss_raw * weight_map
+            loss_dict.update({f'{prefix}/lesion_weight_mean': weight_map.mean()})
+        # =================================            
+
+        # loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        # loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        loss_simple = loss_raw.mean(dim=(1, 2, 3))
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         logvar_t = self.logvar[t].to(self.device)
@@ -1083,7 +1122,8 @@ class LatentDiffusion(DDPM):
 
         loss = self.l_simple_weight * loss.mean()
 
-        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        # loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        loss_vlb = loss_raw.mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
@@ -1095,6 +1135,7 @@ class LatentDiffusion(DDPM):
                         return_x0=False, score_corrector=None, corrector_kwargs=None):
         t_in = t
         model_out = self.apply_model(x, t_in, c, return_ids=return_codebook_ids)
+        
 
         if score_corrector is not None:
             assert self.parameterization == "eps"
@@ -1368,8 +1409,27 @@ class LatentDiffusion(DDPM):
         if sample:
             # get denoise row
             with ema_scope("Sampling"):
-                samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                         ddim_steps=ddim_steps,eta=ddim_eta)
+                if isinstance(c, dict):
+                    c_sample = {
+                        key: [vv[:N] for vv in val] if isinstance(val, list) else val[:N]
+                        for key, val in c.items()
+                    }
+                else:
+                    c_sample = c[:N]
+                print("N =", N)
+                print("z shape =", z.shape)
+                print("c_concat shape =", c["c_concat"][0].shape)
+                print("c_crossattn shape =", c["c_crossattn"][0].shape)
+
+
+
+            samples, z_denoise_row = self.sample_log(
+                cond=c_sample,
+                batch_size=N,
+                ddim=use_ddim,
+                ddim_steps=ddim_steps,
+                eta=ddim_eta
+                )
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
             x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
@@ -1500,29 +1560,38 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm', 'hybrid-adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None):
+    # def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, c_adm=None):
+    def forward(
+    self,
+    x,
+    t,
+    c_concat: list = None,
+    c_crossattn: list = None,
+    c_adm=None,
+    lesion_mask=None,
+):
         if self.conditioning_key is None:
-            out = self.diffusion_model(x, t)
+            out = self.diffusion_model(x, t,lesion_mask=lesion_mask)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t)
+            out = self.diffusion_model(xc, t,lesion_mask=lesion_mask)
         elif self.conditioning_key == 'crossattn':
             # c_crossattn dimension:  torch.Size([8, 1, 768]) 1
             # cc dimension:  torch.Size([8, 1, 768]
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            out = self.diffusion_model(x, t, context=cc,lesion_mask=lesion_mask)
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc)
+            out = self.diffusion_model(xc, t, context=cc,lesion_mask=lesion_mask)
         elif self.conditioning_key == 'hybrid-adm':
             assert c_adm is not None
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc, y=c_adm)
+            out = self.diffusion_model(xc, t, context=cc, y=c_adm,lesion_mask=lesion_mask)
         elif self.conditioning_key == 'adm':
             cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc)
+            out = self.diffusion_model(x, t, y=cc,lesion_mask=lesion_mask)
         else:
             raise NotImplementedError()
 
@@ -2047,3 +2116,6 @@ class MultiCatFrameDiffusion(LatentDiffusion):
                 x_samples_cfg = self.decode_first_stage(samples_cfg)
                 log[f"samples_cfg_scale_{unconditional_guidance_scale:.2f}"] = x_samples_cfg
         return log
+
+
+

@@ -29,6 +29,258 @@ def convert_module_to_f32(x):
     pass
 
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class HaarDWT2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        ll = torch.tensor([[1., 1.], [1., 1.]]) / 2.0
+        lh = torch.tensor([[1., 1.], [-1., -1.]]) / 2.0
+        hl = torch.tensor([[1., -1.], [1., -1.]]) / 2.0
+        hh = torch.tensor([[1., -1.], [-1., 1.]]) / 2.0
+
+        filt = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)  # [4,1,2,2]
+        self.register_buffer("filt", filt)
+
+    def forward(self, x):
+        """
+        x: [B, C, H, W]
+        return:
+            ll, lh, hl, hh: each [B, C, H/2, W/2]
+        """
+        B, C, H, W = x.shape
+        weight = self.filt.repeat(C, 1, 1, 1)  # [4C,1,2,2]
+        y = F.conv2d(x, weight, stride=2, padding=0, groups=C)  # [B,4C,H/2,W/2]
+        y = y.view(B, C, 4, H // 2, W // 2)
+        ll = y[:, :, 0]
+        lh = y[:, :, 1]
+        hl = y[:, :, 2]
+        hh = y[:, :, 3]
+        return ll, lh, hl, hh
+
+
+class HaarIDWT2D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        ll = torch.tensor([[1., 1.], [1., 1.]]) / 2.0
+        lh = torch.tensor([[1., 1.], [-1., -1.]]) / 2.0
+        hl = torch.tensor([[1., -1.], [1., -1.]]) / 2.0
+        hh = torch.tensor([[1., -1.], [-1., 1.]]) / 2.0
+
+        filt = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)  # [4,1,2,2]
+        self.register_buffer("filt", filt)
+
+    def forward(self, ll, lh, hl, hh):
+        """
+        each input: [B, C, H, W]
+        return x: [B, C, 2H, 2W]
+        """
+        B, C, H, W = ll.shape
+        y = torch.stack([ll, lh, hl, hh], dim=2).view(B, 4 * C, H, W)  # [B,4C,H,W]
+        weight = self.filt.repeat(C, 1, 1, 1)  # [4C,1,2,2]
+        x = F.conv_transpose2d(y, weight, stride=2, padding=0, groups=C)
+        return x
+
+
+# class WaveletEnhanceBlock(nn.Module):
+#     """
+#     Wavelet Enhancement Module (WEM)
+#     先做 Haar DWT，将低频/高频分支分别卷积，再用 IDWT 重建。
+#     """
+#     def __init__(self, channels, kernel_size=3):
+#         super().__init__()
+#         pad = kernel_size // 2
+
+#         self.dwt = HaarDWT2D()
+#         self.idwt = HaarIDWT2D()
+
+#         self.conv_ll = nn.Sequential(
+#             normalization(channels),
+#             nn.SiLU(),
+#             conv_nd(2, channels, channels, kernel_size, padding=pad)
+#         )
+#         self.conv_lh = nn.Sequential(
+#             normalization(channels),
+#             nn.SiLU(),
+#             conv_nd(2, channels, channels, kernel_size, padding=pad)
+#         )
+#         self.conv_hl = nn.Sequential(
+#             normalization(channels),
+#             nn.SiLU(),
+#             conv_nd(2, channels, channels, kernel_size, padding=pad)
+#         )
+#         self.conv_hh = nn.Sequential(
+#             normalization(channels),
+#             nn.SiLU(),
+#             conv_nd(2, channels, channels, kernel_size, padding=pad)
+#         )
+
+#         self.fuse = nn.Sequential(
+#             normalization(channels),
+#             nn.SiLU(),
+#             zero_module(conv_nd(2, channels, channels, 3, padding=1))
+#         )
+
+#     def forward(self, x):
+#         residual = x
+#         ll, lh, hl, hh = self.dwt(x)
+
+#         ll = self.conv_ll(ll)
+#         lh = self.conv_lh(lh)
+#         hl = self.conv_hl(hl)
+#         hh = self.conv_hh(hh)
+
+#         x_rec = self.idwt(ll, lh, hl, hh)
+#         x_rec = self.fuse(x_rec)
+
+#         return residual + x_rec
+
+
+class WaveletEnhanceBlock(nn.Module):
+    """
+    Lesion-aware Wavelet Enhancement Module.
+
+    原始 WEM:
+        h' = h + WEM(h)
+
+    改进后:
+        h' = h + G(M) * WEM(h)
+
+    其中 G(M) 是 lesion-aware spatial gate:
+        lesion 区域强增强
+        lesion 周围 ring 区域中等增强
+        background 区域弱增强或不增强
+    """
+
+
+    def __init__(
+        self,
+        channels,
+        kernel_size=3,
+        lesion_strength=1.0,
+        ring_strength=0.3,
+        background_strength=0.02,
+        ring_kernel_size=7,
+        alpha=0.8,
+    ):
+        super().__init__()
+        pad = kernel_size // 2
+
+        self.dwt = HaarDWT2D()
+        self.idwt = HaarIDWT2D()
+
+        self.lesion_strength = lesion_strength
+        self.ring_strength = ring_strength
+        self.background_strength = background_strength
+        self.ring_kernel_size = ring_kernel_size
+        self.alpha = alpha
+
+        self.conv_ll = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(2, channels, channels, kernel_size, padding=pad)
+        )
+        self.conv_lh = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(2, channels, channels, kernel_size, padding=pad)
+        )
+        self.conv_hl = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(2, channels, channels, kernel_size, padding=pad)
+        )
+        self.conv_hh = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(2, channels, channels, kernel_size, padding=pad)
+        )
+
+        self.fuse = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            zero_module(conv_nd(2, channels, channels, 3, padding=1))
+        )
+
+    def build_spatial_gate(self, lesion_mask, target_size, dtype, device):
+        """
+        lesion_mask: [B,1,H,W], latent-level mask
+        target_size: h.shape[-2:]
+        return gate: [B,1,h,w]
+        """
+        if lesion_mask is None:
+            return None
+
+        m = lesion_mask.to(device=device, dtype=dtype)
+        # m = F.interpolate(m, size=target_size, mode="nearest")
+        m = F.interpolate(m,size=target_size,mode="bilinear",align_corners=False)
+        # m = (m > 0.5).to(dtype)
+            # 关键改动2：不要二值化，保留 soft mask
+        m = m.clamp(0, 1)
+
+        # dilate lesion mask to get peri-lesional ring
+        pad = self.ring_kernel_size // 2
+        dilated = F.max_pool2d(
+            m,
+            kernel_size=self.ring_kernel_size,
+            stride=1,
+            padding=pad
+        )
+        ring = (dilated - m).clamp(0, 1)
+            # 关键改动3：平滑 ring，避免边界突变
+        ring = F.avg_pool2d(ring,kernel_size=3,stride=1,padding=1).clamp(0, 1)
+
+        # gate = background + lesion + ring
+        gate = (
+            self.background_strength
+            + self.lesion_strength * m
+            + self.ring_strength * ring
+        )
+
+        return gate.clamp(0, 1)
+
+    def forward(self, x, lesion_mask=None):
+        if not hasattr(self, "_debug_printed"):
+            print("===== WEM DEBUG =====")
+            if lesion_mask is None:
+                print("lesion_mask is None")
+            else:
+                print("lesion_mask shape:", lesion_mask.shape)
+                print("lesion_mask sum:", lesion_mask.sum().item())
+            self._debug_printed = True
+        residual = x
+
+        ll, lh, hl, hh = self.dwt(x)
+
+        ll = self.conv_ll(ll)
+        lh = self.conv_lh(lh)
+        hl = self.conv_hl(hl)
+        hh = self.conv_hh(hh)
+
+        x_rec = self.idwt(ll, lh, hl, hh)
+        x_rec = self.fuse(x_rec)
+
+        gate = self.build_spatial_gate(
+            lesion_mask=lesion_mask,
+            target_size=x.shape[-2:],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        if gate is not None:
+            x_rec = x_rec * gate
+        else:
+            # 没有 mask 时，保留极弱背景增强，避免完全关闭 WEM
+            x_rec = x_rec * self.background_strength
+
+        #return residual + x_rec
+        return residual + self.alpha * x_rec
+
+
 ## go
 class AttentionPool2d(nn.Module):
     """
@@ -78,12 +330,24 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    # def forward(self, x, emb, context=None):
+    #     for layer in self:
+    #         if isinstance(layer, TimestepBlock):
+    #             x = layer(x, emb)
+    #         elif isinstance(layer, SpatialTransformer):
+    #             x = layer(x, context)
+    #         else:
+    #             x = layer(x)
+    #     return x
+
+    def forward(self, x, emb, context=None, lesion_mask=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
+            elif isinstance(layer, WaveletEnhanceBlock):
+                x = layer(x, lesion_mask=lesion_mask)
             else:
                 x = layer(x)
         return x
@@ -468,7 +732,11 @@ class UNetModel(nn.Module):
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
         disable_self_attentions=None,
-        num_attention_blocks=None
+        num_attention_blocks=None,
+        use_wem=False,
+        wem_in_decoder=False,
+        wem_in_middle=True,
+        wem_kernel_size=3,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -523,6 +791,11 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+        self.use_wem = use_wem
+        self.wem_in_decoder = wem_in_decoder
+        self.wem_in_middle = wem_in_middle
+        self.wem_kernel_size = wem_kernel_size
+        self.use_spatial_transformer = use_spatial_transformer
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -622,33 +895,43 @@ class UNetModel(nn.Module):
         if legacy:
             #num_heads = 1
             dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-        self.middle_block = TimestepEmbedSequential(
+        middle_layers = [
             ResBlock(
-                ch,
-                time_embed_dim,
-                dropout,
-                dims=dims,
-                use_checkpoint=use_checkpoint,
-                use_scale_shift_norm=use_scale_shift_norm,
-            ),
-            AttentionBlock(
-                ch,
-                use_checkpoint=use_checkpoint,
-                num_heads=num_heads,
-                num_head_channels=dim_head,
-                use_new_attention_order=use_new_attention_order,
-            ) if not use_spatial_transformer else SpatialTransformer(  # always uses a self-attn
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
-                        ),
-            ResBlock(
-                ch,
-                time_embed_dim,
-                dropout,
-                dims=dims,
-                use_checkpoint=use_checkpoint,
-                use_scale_shift_norm=use_scale_shift_norm,
-            ),
-        )
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    ),    
+                AttentionBlock(
+                        ch,
+                        use_checkpoint=use_checkpoint,
+                        num_heads=num_heads,
+                        num_head_channels=dim_head,
+                        use_new_attention_order=use_new_attention_order,
+                    ) if not use_spatial_transformer else SpatialTransformer(
+                        ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                    ),
+                    ResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    ),
+                ]
+
+        if self.use_wem and self.wem_in_middle:
+            #middle_layers.append(WaveletEnhanceBlock(ch, kernel_size=self.wem_kernel_size))
+            middle_layers.append(WaveletEnhanceBlock(ch,kernel_size=self.wem_kernel_size,lesion_strength=1.0,ring_strength=0.3,background_strength=0.02,ring_kernel_size=7,alpha=0.8,
+    )
+)
+
+        self.middle_block = TimestepEmbedSequential(*middle_layers)
+        # print("DEBUG: middle_block created =", hasattr(self, "middle_block"))
+        
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -711,6 +994,11 @@ class UNetModel(nn.Module):
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
+                # self.output_blocks.append(TimestepEmbedSequential(*layers))
+                # self._feature_size += ch
+                if self.use_wem and self.wem_in_decoder and level == 0:
+                    layers.append(WaveletEnhanceBlock(ch, kernel_size=self.wem_kernel_size))
+
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
@@ -742,7 +1030,8 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    # def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, lesion_mask=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -754,6 +1043,7 @@ class UNetModel(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
+        print("DEBUG forward has middle_block:", hasattr(self, "middle_block"))
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
@@ -763,13 +1053,23 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
+        # for module in self.input_blocks:
+        #     h = module(h, emb, context)
+        #     hs.append(h)
+
         for module in self.input_blocks:
-            h = module(h, emb, context)
+            h = module(h, emb, context, lesion_mask=lesion_mask)
             hs.append(h)
-        h = self.middle_block(h, emb, context)
+
+        # h = self.middle_block(h, emb, context)
+        h = self.middle_block(h, emb, context, lesion_mask=lesion_mask)
+        # for module in self.output_blocks:
+        #     h = th.cat([h, hs.pop()], dim=1)
+        #     h = module(h, emb, context)
+
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
+            h = module(h, emb, context, lesion_mask=lesion_mask)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)

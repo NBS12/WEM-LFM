@@ -41,6 +41,10 @@ model:
         context_dim: 768
         use_checkpoint: True
         legacy: False
+        use_wem: true
+        wem_in_decoder: false
+        wem_in_middle: true 
+        wem_kernel_size: 3
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL
@@ -72,9 +76,9 @@ model:
 data:
   target: ldm.data.simple.ObjaverseDataModuleFromConfig
   params:
-    root_dir: 'views_whole_sphere'
+    root_dir: '/dev/raid/zjs_dc3/24sxx/data'
     batch_size: 32
-    num_workers: 16
+    num_workers: 2
     total_view: 4
     train:
       validation: False
@@ -89,29 +93,41 @@ data:
 
 lightning:
   find_unused_parameters: false
-  metrics_over_trainsteps_checkpoint: True
+  # metrics_over_trainsteps_checkpoint: True
   modelcheckpoint:
     params:
-      every_n_train_steps: 5000
+      monitor: val/loss_simple_ema
+      mode: min
+      save_top_k: 2
+      save_last: true
+      every_n_epochs: 400
+      filename: "{epoch:03}-{val_loss_simple_ema:.4f}"
   callbacks:
+    metrics_over_trainsteps_checkpoint: 
+      params:
+        every_n_train_steps: 14000  #5000
     image_logger:
       target: main.ImageLogger
       params:
-        batch_frequency: 500
-        max_images: 32
+        batch_frequency: 20000000
+        max_images: 1
         increase_log_steps: False
-        log_first_step: True
+        log_first_step: False
         log_images_kwargs:
           use_ema_scope: False
           inpaint: False
           plot_progressive_rows: False
           plot_diffusion_rows: False
-          N: 32
+          N: 1
           unconditional_guidance_scale: 3.0
           unconditional_guidance_label: [""]
 
   trainer:
     benchmark: True
-    val_check_interval: 5000000 # really sorry
+    val_check_interval: 5000000 # really sorry 5000000
     num_sanity_val_steps: 0
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 2
+    max_epochs: 400
+    accelerator: "gpu"
+    devices: 1
+   
